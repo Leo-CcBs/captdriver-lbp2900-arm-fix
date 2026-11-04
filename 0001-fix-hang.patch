@@ -1,0 +1,249 @@
+--- a/src/capt-command.h	2026-11-04 11:18:31.297699830 +0800
++++ b/src/capt-command.h	2026-11-04 11:18:31.317699008 +0800
+@@ -54,6 +54,7 @@
+ 
+ 	CAPT_JOB_SETUP  = 0xE1A1,
+ 	CAPT_GPIO       = 0xE1A2,
++	CAPT3_UNK_0     = 0xE0BA,
+ };
+ 
+ 
+--- a/src/capt-status.c	2026-11-04 11:18:31.297699830 +0800
++++ b/src/capt-status.c	2026-11-04 11:18:31.321698844 +0800
+@@ -119,20 +119,41 @@
+ 	return &status;
+ }
+ 
++/* 等待打印机就绪的超时上限（秒），防止状态异常时永久挂死 */
++#define CAPT_WAIT_READY_TIMEOUT 120
++
+ void capt_wait_ready(void)
+ {
+-	while (FLAG(capt_get_status(), CAPT_FL_BUSY))
++	unsigned wait_count = 0;
++	while (FLAG(capt_get_status(), CAPT_FL_BUSY)) {
++		if (++wait_count > CAPT_WAIT_READY_TIMEOUT) {
++			fprintf(stderr, "ERROR: CAPT: printer busy timeout after %u s\n", wait_count);
++			return;
++		}
+ 		sleep(1);
++	}
+ }
+ 
+ void capt_wait_xready(void)
+ {
+-	while (FLAG(capt_get_xstatus(), CAPT_FL_BUSY))
++	unsigned wait_count = 0;
++	while (FLAG(capt_get_xstatus(), CAPT_FL_BUSY)) {
++		if (++wait_count > CAPT_WAIT_READY_TIMEOUT) {
++			fprintf(stderr, "ERROR: CAPT: printer busy timeout after %u s\n", wait_count);
++			return;
++		}
+ 		sleep(1);
++	}
+ }
+ 
+ void capt_wait_xready_only(void)
+ {
+-       while (FLAG(capt_get_xstatus_only(), CAPT_FL_BUSY))
+-               sleep(1);
++	unsigned wait_count = 0;
++	while (FLAG(capt_get_xstatus_only(), CAPT_FL_BUSY)) {
++		if (++wait_count > CAPT_WAIT_READY_TIMEOUT) {
++			fprintf(stderr, "ERROR: CAPT: printer busy timeout after %u s\n", wait_count);
++			return;
++		}
++		sleep(1);
++	}
+ }
+--- a/src/printer.h	2026-11-04 11:18:31.301699665 +0800
++++ b/src/printer.h	2026-11-04 11:18:31.321698844 +0800
+@@ -57,6 +57,7 @@
+ 
+ const struct printer_ops_s *printer_detect(void);
+ 
++void cancel_job(int sig);
+ 
+ void __printer_register_ops(const char *name, const struct printer_ops_s *ops,
+ 		enum printer_support status);
+--- a/src/prn_lbp2900.c	2026-11-04 11:18:31.301699665 +0800
++++ b/src/prn_lbp2900.c	2026-11-04 11:18:31.325698680 +0800
+@@ -34,6 +34,9 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++/* 等待打印机状态的超时上限（秒），防止状态回报异常时永久挂死 */
++#define CAPT_WAIT_TIMEOUT 120
++
+ uint16_t job;
+ 
+ struct printer_gpio_s {
+@@ -310,9 +313,15 @@
+ 		lbp2900_wait_ready(state->ops);
+ 	}
+ 
++	unsigned wait_count = 0;
+ 	while (1) {
+ 		if (! FLAG(lbp2900_get_status(state->ops), CAPT_FL_BUFFERFULL))
+ 			break;
++		if (++wait_count > CAPT_WAIT_TIMEOUT) {
++			fprintf(stderr, "ERROR: CAPT: printer buffer full timeout after %u s\n",
++				wait_count);
++			return false;
++		}
+ 		sleep(1);
+ 	}
+ 
+@@ -350,15 +359,32 @@
+ 
+ 	send_job_start(6, status->page_decoding);
+ 
++	unsigned wait_count = 0;
+ 	while (1) {
+ 		const struct capt_status_s *status = lbp2900_get_status(state->ops);
+ 		/* Interesting. Using page_printing here results in shifted print */
+ 		if (status->page_out == status->page_decoding)
+ 			return true;
+ 		if (FLAG(status, CAPT_FL_NOPAPER2) || FLAG(status, CAPT_FL_NOPAPER1)) {
+-			fprintf(stderr, "DEBUG: CAPT: no paper\n");
+-			if (FLAG(status, CAPT_FL_PRINTING) || FLAG(status, CAPT_FL_PROCESSING1))
++			fprintf(stderr, "DEBUG: CAPT: no paper (P1=%d P2=%d printing=%d processing=%d)\n",
++				FLAG(status, CAPT_FL_NOPAPER1), FLAG(status, CAPT_FL_NOPAPER2),
++				FLAG(status, CAPT_FL_PRINTING), FLAG(status, CAPT_FL_PROCESSING1));
++			if (FLAG(status, CAPT_FL_PRINTING) || FLAG(status, CAPT_FL_PROCESSING1)) {
++				if (++wait_count > CAPT_WAIT_TIMEOUT) {
++					fprintf(stderr, "ERROR: CAPT: page output timeout (no paper) after %u s\n",
++						wait_count);
++					return false;
++				}
++				sleep(1);
+ 				continue;
++			}
++			return false;
++		}
++		if (++wait_count > CAPT_WAIT_TIMEOUT) {
++			fprintf(stderr, "ERROR: CAPT: page output timeout after %u s "
++				"(decoding=%u printing=%u out=%u completed=%u received=%u)\n",
++				wait_count, status->page_decoding, status->page_printing,
++				status->page_out, status->page_completed, status->page_received);
+ 			return false;
+ 		}
+ 		sleep(1);
+@@ -368,6 +394,7 @@
+ static void lbp2900_job_epilogue(struct printer_state_s *state)
+ {
+ 	uint8_t jbuf[2] = { LO(job), HI(job) };
++	unsigned wait_count = 0;
+ 
+ 	while (1) {
+ 		const struct capt_status_s *status = lbp2900_get_status(state->ops);
+@@ -375,6 +402,12 @@
+ 			send_job_start(4, status->page_completed);
+ 			break;
+ 		}
++		if (++wait_count > CAPT_WAIT_TIMEOUT) {
++			fprintf(stderr, "ERROR: CAPT: job end timeout after %u s "
++				"(decoding=%u completed=%u)\n", wait_count,
++				status->page_decoding, status->page_completed);
++			break;
++		}
+ 		sleep(1);
+ 	}
+ 	capt_sendrecv(CAPT_JOB_END, jbuf, 2, NULL, 0);
+@@ -421,6 +454,7 @@
+ static void lbp2900_wait_user(struct printer_state_s *state)
+ {
+ 	(void) state;
++	unsigned wait_count = 0;
+ 
+ 	capt_sendrecv(CAPT_GPIO, lbp2900_gpio_blink, ARRAY_SIZE(lbp2900_gpio_blink), NULL, 0);
+ 	lbp2900_wait_ready(state->ops);
+@@ -434,6 +468,11 @@
+ 			fprintf(stderr, "DEBUG: CAPT: button pressed\n");
+ 			break;
+ 		}
++		if (++wait_count > 60) {
++			fprintf(stderr, "ERROR: CAPT: waiting for button timed out after %u s, continue anyway\n",
++				wait_count);
++			break;
++		}
+ 		sleep(1);
+ 	}
+ 
+--- a/src/rastertocapt.c	2026-11-04 11:18:31.301699665 +0800
++++ b/src/rastertocapt.c	2026-11-04 11:18:31.321698844 +0800
+@@ -230,9 +230,13 @@
+ 	exit(1);
+ }
+ 
++/* 每一页最多重试次数，超过则跳过，避免同一页反复打印 */
++#define CAPT_MAX_PAGE_RETRIES 2
++
+ static void do_print(int fd)
+ {
+ 	bool in_job = false;
++	unsigned page_retries = 0;
+ 	ops = printer_detect();
+ 
+ 	if (ops->alloc_state)
+@@ -260,6 +264,7 @@
+ 				abort();
+ 
+ 			state->ipage += 1;
++			page_retries = 0;	/* 新的一页，重试计数清零 */
+ 
+ 			page_set_dims(&cached_page->dims, &header);
+ 
+@@ -285,6 +290,13 @@
+ 			bool ok = ops->page_prologue(state, &cached_page->dims);
+ 			if (! ok) {
+ 				fprintf(stderr, "DEBUG: CAPT: rastertocapt: can't start page\n");
++				if (++page_retries > CAPT_MAX_PAGE_RETRIES) {
++					fprintf(stderr, "ERROR: CAPT: page %u failed to start %u times, skipping\n",
++						state->ipage, page_retries);
++					free_cached_page(cached_page);
++					cached_page = NULL;
++					continue;
++				}
+ 				ops->wait_user(state);
+ 				if (in_job) {
+ 					fprintf(stderr, "DEBUG: CAPT: rastertocapt: retry job\n");
+@@ -304,6 +316,13 @@
+ 			bool ok = ops->page_epilogue(state, &cached_page->dims);
+ 			if (! ok) {
+ 				fprintf(stderr, "DEBUG: CAPT: rastertocapt: page not printed\n");
++				if (++page_retries > CAPT_MAX_PAGE_RETRIES) {
++					fprintf(stderr, "ERROR: CAPT: page %u failed to print %u times, skipping\n",
++						state->ipage, page_retries);
++					free_cached_page(cached_page);
++					cached_page = NULL;
++					continue;
++				}
+ 				ops->wait_user(state);
+ 				continue;
+ 			}
+@@ -312,12 +331,7 @@
+ 		page_printed = true;
+ 
+ 		if (page_printed) {
+-			while (cached_page->bands) {
+-				void *p = cached_page->bands;
+-				cached_page->bands = cached_page->bands->next;
+-				free(p);
+-			}
+-			free(cached_page);
++			free_cached_page(cached_page);
+ 			cached_page = NULL;
+ 		}
+ 	}
+--- a/src/std.h	2026-11-04 11:18:31.305699501 +0800
++++ b/src/std.h	2026-11-04 11:18:31.321698844 +0800
+@@ -19,6 +19,8 @@
+ 
+ #pragma once
+ 
++#define _POSIX_C_SOURCE 199309L /* try removing this if build fails */
++
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
